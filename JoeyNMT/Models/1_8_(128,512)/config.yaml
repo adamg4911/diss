@@ -1,0 +1,113 @@
+data:
+  dataset_type: plain
+  dev: sign_data/dev
+  sample_dev_subset: -1
+  sample_train_subset: -1
+  src:
+    lang: text
+    level: word
+    max_length: 80
+    voc_file: sign_data/vocab_src.txt
+  test: sign_data/test
+  train: sign_data/train
+  trg:
+    lang: gloss
+    level: word
+    max_length: 80
+    voc_file: sign_data/vocab_trg.txt
+joeynmt_version: 2.0.0
+model:
+  bias_initializer: zeros
+  decoder:
+    activation: relu
+    dropout: 0.1
+    embeddings:
+      embedding_dim: 128
+      freeze: false
+      scale: false
+    ff_size: 512
+    freeze: false
+    hidden_size: 128
+    layer_norm: pre
+    num_heads: 8
+    num_layers: 1
+    type: transformer
+  embed_init_gain: 1.0
+  embed_initializer: xavier_normal
+  encoder:
+    activation: relu
+    dropout: 0.1
+    embeddings:
+      embedding_dim: 128
+      freeze: false
+      scale: false
+    ff_size: 512
+    freeze: false
+    hidden_size: 128
+    layer_norm: pre
+    num_heads: 8
+    num_layers: 1
+    type: transformer
+  init_gain: 1.0
+  initializer: xavier_normal
+  tied_embeddings: false
+  tied_softmax: true
+name: toy_experiment
+testing:
+  batch_size: 10
+  batch_type: sentence
+  beam_alpha: 1.0
+  beam_size: 1
+  eval_metrics:
+  - bleu1
+  - bleu2
+  - bleu3
+  - bleu4
+  - rouge
+  generate_unk: true
+  max_output_length: 80
+  min_output_length: 1
+  n_best: 1
+  no_repeat_ngram_size: -1
+  repetition_penalty: -1
+  return_attention: false
+  return_prob: none
+  sacrebleu_cfg:
+    tokenize: 13a
+    whitespace: false
+training:
+  adam_betas:
+  - 0.9
+  - 0.999
+  batch_multiplier: 1
+  batch_size: 32
+  batch_type: sentence
+  clip_grad_norm: 5.0
+  decrease_factor: 0.7
+  early_stopping_metric: bleu2
+  epochs: 20000
+  keep_best_ckpts: 3
+  label_smoothing: 0.0
+  learning_rate: 0.001
+  learning_rate_min: 0.0002
+  logging_freq: 10
+  loss: crossentropy
+  model_dir: ./Models/_1_8_(128, 512)
+  normalization: batch
+  optimizer: adam
+  overwrite: true
+  patience: 8
+  print_valid_sents:
+  - 0
+  - 1
+  - 2
+  random_seed: 27
+  reset_best_ckpt: false
+  reset_iter_state: false
+  reset_optimizer: false
+  reset_scheduler: false
+  scheduling: plateau
+  shuffle: true
+  use_cuda: true
+  validation_freq: 500
+  weight_decay: 0.001
