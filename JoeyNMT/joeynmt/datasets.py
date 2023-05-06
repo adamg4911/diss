@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Tuple, Union
 import pickle
 
 import torch
+
 from torch.utils.data import (
     BatchSampler,
     DataLoader,
@@ -18,6 +19,7 @@ from torch.utils.data import (
     Sampler,
     SequentialSampler,
 )
+from joeynmt.constants import BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, UNK_TOKEN
 
 from joeynmt.batch import Batch
 from joeynmt.constants import PAD_ID
@@ -47,7 +49,7 @@ class BaseDataset(Dataset):
         path: str,
         src_lang: str,
         trg_lang: str,
-        split: str = "train",
+        split: int = "train",
         has_trg: bool = True,
         tokenizer: Dict[str, BasicTokenizer] = None,
         sequence_encoder: Dict[str, Callable] = None,
@@ -58,6 +60,7 @@ class BaseDataset(Dataset):
         self.trg_lang = trg_lang
         self.has_trg = has_trg
         self.split = split
+        print(self.has_trg)
         if self.split == "train":
             assert self.has_trg
 
@@ -210,12 +213,12 @@ class BaseDataset(Dataset):
                                               drop_last=False)
         else:
             raise ConfigurationError(f"{batch_type}: Unknown batch type")
-
+    
         assert self.sequence_encoder[self.src_lang] is not None
         if self.has_trg:
             assert self.sequence_encoder[self.trg_lang] is not None
-        # else:
-        #    self.sequence_encoder[self.trg_lang] = None
+        else:
+            self.sequence_encoder[self.trg_lang] = None
 
         # data iterator
         return DataLoader(
@@ -269,6 +272,13 @@ class PlaintextDataset(BaseDataset):
         # for random subsampling
         self.idx_map = []
 
+    def post_process(self, sequence, generate_unk=False):
+        if generate_unk:
+            sequence = [s for s in sequence if s not in [BOS_TOKEN, EOS_TOKEN, PAD_TOKEN]]
+        else:
+            sequence = [s for s in sequence if s not in [BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, UNK_TOKEN]]
+        return " ".join(sequence)
+
     def load_data(self) -> Any:
 
         # def _pre_process(seq, lang):
@@ -311,7 +321,8 @@ class PlaintextDataset(BaseDataset):
     def get_item(self, idx: int, lang: str, is_train: bool = None) -> List[str]:
         line = self._look_up_item(idx, lang)
         is_train = self.split == "train" if is_train is None else is_train
-        item = self.tokenizer[lang](line, is_train=is_train)
+        # item = self.tokenizer[lang](line, is_train=is_train)
+        item = line.split(" ")
         return item
 
     def _look_up_item(self, idx: int, lang: str) -> str:
@@ -321,8 +332,8 @@ class PlaintextDataset(BaseDataset):
             line = self.data[lang][idx]
             return line
         except Exception as e:
-            logger.error(idx, self._initial_len, e)
-            raise ValueError from e
+            print(idx, self._initial_len)
+            raise Exception from e
 
     def get_list(self,
                  lang: str,
@@ -454,6 +465,7 @@ class StreamDataset(BaseDataset):
     """
     StreamDataset which interacts with stream inputs.
     - called by `translate()` func in `prediction.py`.
+    - src side only, no trg expected.
     """
 
     def __init__(
@@ -482,37 +494,26 @@ class StreamDataset(BaseDataset):
         # place holder
         self.cache = {}
 
-    def set_item(self, src_line: str, trg_line: str = None) -> None:
+    def set_item(self, line: str) -> None:
         """
-        Set input text to the cache.
+        Set source text to the cache.
 
-        :param src_line: (str)
-        :param trg_line: (str)
+        :param line: (str)
         """
-        assert isinstance(src_line, str) and src_line.strip() != "", \
+        assert isinstance(line, str) and line.strip() != "", \
             "The input sentence is empty! Please make sure " \
             "that you are feeding a valid input."
 
         idx = len(self.cache)
-        src_line = self.tokenizer[self.src_lang].pre_process(src_line)
-
-        if self.has_trg:
-            trg_line = self.tokenizer[self.trg_lang].pre_process(trg_line)
-        self.cache[idx] = (src_line, trg_line)
+        line = self.tokenizer[self.src_lang].pre_process(line)
+        self.cache[idx] = (line, None)
 
     def get_item(self, idx: int, lang: str, is_train: bool = None) -> List[str]:
         # pylint: disable=unused-argument
         assert idx in self.cache, (idx, self.cache)
-        assert lang in [self.src_lang, self.trg_lang]
-        if lang == self.trg_lang:
-            assert self.has_trg
-
-        line = {}
-        src_line, trg_line = self.cache[idx]
-        line[self.src_lang] = src_line
-        line[self.trg_lang] = trg_line
-
-        item = self.tokenizer[lang](line[lang], is_train=False)
+        assert lang == self.src_lang, (lang, self.src_lang)
+        line, _ = self.cache[idx]
+        item = self.tokenizer[lang](line, is_train=False)
         return item
 
     def __len__(self) -> int:
@@ -529,7 +530,6 @@ class BaseHuggingfaceDataset(BaseDataset):
     Wrapper for Huggingface's dataset object
     cf.) https://huggingface.co/docs/datasets
     """
-    COLUMN_NAME = "sentence"  # dummy column name. should be overriden.
 
     def __init__(
         self,
@@ -559,19 +559,10 @@ class BaseHuggingfaceDataset(BaseDataset):
     def load_data(self, path: str, **kwargs) -> Any:
         # pylint: disable=import-outside-toplevel
         try:
-            from datasets import Dataset as Dataset_hf
-            from datasets import DatasetDict, config, load_dataset, load_from_disk
-            if Path(path, config.DATASET_STATE_JSON_FILENAME).exists() \
-                    or Path(path, config.DATASETDICT_JSON_FILENAME).exists():
-                hf_dataset = load_from_disk(path)
-                if isinstance(hf_dataset, DatasetDict):
-                    assert kwargs["split"] in hf_dataset
-                    hf_dataset = hf_dataset[kwargs["split"]]
-            else:
-                hf_dataset = load_dataset(path, **kwargs)
-            assert isinstance(hf_dataset, Dataset_hf)
-            assert self.COLUMN_NAME in hf_dataset.features
-            return hf_dataset
+            from datasets import config, load_dataset, load_from_disk
+            if Path(path, config.DATASET_STATE_JSON_FILENAME).exists():
+                return load_from_disk(path)
+            return load_dataset(path, **kwargs)
 
         except ImportError as e:
             logger.error(e)
@@ -589,7 +580,7 @@ class BaseHuggingfaceDataset(BaseDataset):
 
     def get_item(self, idx: int, lang: str, is_train: bool = None) -> List[str]:
         # lookup
-        line = self.dataset[idx][self.COLUMN_NAME]
+        line = self.dataset[idx]
         assert lang in line, (line, lang)
 
         # tokenize
@@ -599,13 +590,11 @@ class BaseHuggingfaceDataset(BaseDataset):
 
     def get_list(self, lang: str, tokenized: bool = False) -> List[str]:
         if tokenized:
-
-            def _tok(item):
-                item[f'tok_{lang}'] = self.tokenizer[lang](item[self.COLUMN_NAME][lang])
-                return item
-
-            return self.dataset.map(_tok, desc=f"Tokenizing {lang}...")[f'tok_{lang}']
-        return self.dataset.flatten()[f'{self.COLUMN_NAME}.{lang}']
+            return self.dataset.map(
+                lambda item: {f"tok_{lang}": self.tokenizer[lang](item[lang])},
+                desc=f"Tokenizing {lang}...",
+            )[f"tok_{lang}"]
+        return self.dataset[lang]
 
     def __len__(self) -> int:
         return self.dataset.num_rows
@@ -620,52 +609,62 @@ class BaseHuggingfaceDataset(BaseDataset):
         return ret
 
 
-class HuggingfaceTranslationDataset(BaseHuggingfaceDataset):
+class HuggingfaceDataset(BaseHuggingfaceDataset):
     """
     Wrapper for Huggingface's `datasets.features.Translation` class
     cf.) https://github.com/huggingface/datasets/blob/master/src/datasets/features/translation.py
     """  # noqa
-    COLUMN_NAME = "translation"
 
     def load_data(self, path: str, **kwargs) -> Any:
         dataset = super().load_data(path=path, **kwargs)
-        # pylint: disable=import-outside-toplevel
-        try:
-            from datasets.features import Translation as Translation_hf
-            assert isinstance(dataset.features[self.COLUMN_NAME], Translation_hf), \
-                f"Data type mismatch. Please cast `{self.COLUMN_NAME}` column to " \
-                "datasets.features.Translation class."
-            assert self.src_lang in dataset.features[self.COLUMN_NAME].languages
+
+        # rename columns
+        if "translation" in dataset.features:
+            # check language pair
+            lang_pair = dataset.features["translation"].languages
+            assert self.src_lang in lang_pair, (self.src_lang, lang_pair)
+
+            # rename columns
+            columns = {f"translation.{self.src_lang}": self.src_lang}
             if self.has_trg:
-                assert self.trg_lang in dataset.features[self.COLUMN_NAME].languages
+                assert self.trg_lang in lang_pair, (self.trg_lang, lang_pair)
+                columns[f"translation.{self.trg_lang}"] = self.trg_lang
 
-        except ImportError as e:
-            logger.error(e)
-            raise ImportError from e
+            # flatten
+            dataset = dataset.flatten()
 
-        # preprocess (lowercase, pretokenize, etc.) + validity check
+        elif f"{self.src_lang}_sentence" in dataset.features:
+            # rename columns
+            columns = {f"{self.src_lang}_sentence": self.src_lang}
+            if self.has_trg:
+                assert f"{self.trg_lang}_sentence" in dataset.features
+                columns[f"{self.trg_lang}_sentence"] = self.trg_lang
+
+        else:
+            pass
+            # TODO: support other field names
+        dataset = dataset.rename_columns(columns)
+
+        # preprocess (lowercase, pretokenize, etc.)
         def _pre_process(item):
             sl = self.src_lang
-            item[self.COLUMN_NAME][sl] = self.tokenizer[sl].pre_process(
-                item[self.COLUMN_NAME][sl])
+            tl = self.trg_lang
+            ret = {sl: self.tokenizer[sl].pre_process(item[sl])}
             if self.has_trg:
-                tl = self.trg_lang
-                item[self.COLUMN_NAME][tl] = self.tokenizer[tl].pre_process(
-                    item[self.COLUMN_NAME][tl])
-            return item
+                ret[tl] = self.tokenizer[tl].pre_process(item[tl])
+            return ret
 
         def _drop_nan(item):
-            src_item = item[self.COLUMN_NAME][self.src_lang]
-            is_src_valid = src_item is not None and len(src_item) > 0
+            sl = self.src_lang
+            tl = self.trg_lang
+            is_src_valid = item[sl] is not None and len(item[sl]) > 0
             if self.has_trg:
-                trg_item = item[self.COLUMN_NAME][self.trg_lang]
-                is_trg_valid = trg_item is not None and len(trg_item) > 0
+                is_trg_valid = item[tl] is not None and len(item[tl]) > 0
                 return is_src_valid and is_trg_valid
             return is_src_valid
 
         dataset = dataset.filter(_drop_nan, desc="Dropping NaN...")
-        dataset = dataset.map(_pre_process, desc="Preprocessing...")
-        return dataset
+        return dataset.map(_pre_process, desc="Preprocessing...")
 
 
 def build_dataset(
@@ -697,6 +696,8 @@ def build_dataset(
     has_trg = True  # by default, we expect src-trg pairs
 
     if dataset_type == "plain":
+        print(path)
+        print(trg_lang)
         if not Path(path).with_suffix(f"{Path(path).suffix}.{trg_lang}").is_file():
             # no target is given -> create dataset from src only
             has_trg = False
@@ -739,7 +740,7 @@ def build_dataset(
         # "split" should be specified in kwargs
         if "split" not in kwargs:
             kwargs["split"] = "validation" if split == "dev" else split
-        dataset = HuggingfaceTranslationDataset(
+        dataset = HuggingfaceDataset(
             path=path,
             src_lang=src_lang,
             trg_lang=trg_lang,
@@ -750,7 +751,7 @@ def build_dataset(
             **kwargs,
         )
     else:
-        raise ConfigurationError(f"{dataset_type}: Unknown dataset type.")
+        ConfigurationError(f"{dataset_type}: Unknown dataset type.")
     return dataset
 
 

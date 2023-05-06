@@ -10,16 +10,16 @@ from functools import partial
 from itertools import zip_longest
 from pathlib import Path
 from typing import Dict, List, Tuple
+import pickle
 
+from tqdm import tqdm
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from tqdm import tqdm
 
 from joeynmt.data import load_data
 from joeynmt.datasets import StreamDataset, build_dataset
 from joeynmt.helpers import (
-    check_version,
     expand_reverse_index,
     load_checkpoint,
     load_config,
@@ -31,13 +31,43 @@ from joeynmt.helpers import (
     store_attention_plots,
     write_list_to_file,
 )
-from joeynmt.metrics import bleu, chrf, sequence_accuracy, token_accuracy
+from joeynmt.datasets import PlaintextDataset
+from joeynmt.vocabulary import Vocabulary
+from joeynmt.metrics import chrf, sequence_accuracy, token_accuracy
 from joeynmt.model import Model, _DataParallel, build_model
 from joeynmt.search import search
 from joeynmt.tokenizers import build_tokenizer
 from joeynmt.vocabulary import build_vocab
 
+from external_metrics import sacrebleu
+from external_metrics import mscoco_rouge
+
+import numpy as np
+
+def test_bleu(hypotheses, references, all=False):
+    """
+    Raw corpus BLEU from sacrebleu (without tokenization)
+
+    :param hypotheses: list of hypotheses (strings)
+    :param references: list of references (strings)
+    :return:
+    """
+    bleu_scores = sacrebleu.raw_corpus_bleu(
+        sys_stream=hypotheses, ref_streams=[references]
+    ).scores
+    scores = {}
+    return bleu_scores
+
 logger = logging.getLogger(__name__)
+
+def rouge(hypotheses, references):
+    rouge_score = 0
+    n_seq = len(hypotheses)
+
+    for h, r in zip(hypotheses, references):
+        rouge_score += mscoco_rouge.calc_score(hypotheses=[h], references=[r]) / n_seq
+
+    return rouge_score
 
 
 def predict(
@@ -152,20 +182,15 @@ def predict(
                 assert model.loss_function is not None
 
                 # don't track gradients during validation
-                with torch.autocast(device_type=device.type, enabled=fp16):
-                    with torch.no_grad():
-                        batch_loss, log_probs, attn, n_correct = model(
-                            return_type="loss",
-                            return_attention=return_attention,
-                            **vars(batch))
-
-                # sum over multiple gpus
-                batch_loss = batch.normalize(batch_loss, "sum", n_gpu=n_gpu)
-                n_correct = batch.normalize(n_correct, "sum", n_gpu=n_gpu)
-                if return_prob == "ref":
-                    ref_scores = batch.score(log_probs)
-                    attention_scores = attn.detach().cpu().float().numpy()
-                    output = batch.trg
+                with torch.no_grad():
+                    batch_loss, log_probs, _, n_correct = model(return_type="loss",
+                                                                **vars(batch))
+                    # sum over multiple gpus
+                    batch_loss = batch.normalize(batch_loss, "sum", n_gpu=n_gpu)
+                    n_correct = batch.normalize(n_correct, "sum", n_gpu=n_gpu)
+                    if return_prob == "ref":
+                        ref_scores = batch.score(log_probs)
+                        output = batch.trg
 
                 total_loss += batch_loss.item()  # cast Tensor to float
                 total_n_correct += n_correct.item()  # cast Tensor to int
@@ -230,9 +255,20 @@ def predict(
     # decode ids back to str symbols (cut-off AFTER eos; eos itself is included.)
     decoded_valid = model.trg_vocab.arrays_to_sentences(arrays=all_outputs,
                                                         cut_at_eos=True)
+    #bruh bruh bruh
+    ############################################
+#################################################
+    # print(decoded_valid[0]) #SAVE THIS TO RUN ON GLOSSES
+    # preds = []
+    # f = open("dev_gloss_preds.txt", "w")
+    # for i in decoded_valid:
+    #     f.write(" ".join(i[:-1])+"\n")
+    # f.close()
+    # sys.exit()
     # TODO: `valid_sequence_scores` should have the same seq length as `decoded_valid`
     #     -> needed to be cut-off at eos synchronously
-
+#####################################################
+####################################################
     if return_prob == "ref":  # no evaluation needed
         logger.info(
             "Evaluation result (scoring) %s, duration: %.4f[sec]",
@@ -242,22 +278,20 @@ def predict(
             ]),
             gen_duration,
         )
-        return (
-            valid_scores,
-            None,  # valid_ref
-            None,  # valid_hyp
-            decoded_valid,
-            valid_sequence_scores,
-            valid_attention_scores,
-        )
+        return valid_scores, None, None, decoded_valid, valid_sequence_scores, None
 
     # retrieve detokenized hypotheses and references
+    # def _post_process(self, )
+    # print(data.trg_lang)
+    # print(decoded_valid[0])
+    # print(data.post_process(decoded_valid[0], True))
+    # sys.exit()
     valid_hyp = [
-        data.tokenizer[data.trg_lang].post_process(s, generate_unk=generate_unk)
+        data.post_process(s, generate_unk=generate_unk)
         for s in decoded_valid
     ]
     # references are not length-filtered, not duplicated for n_best > 1
-    valid_ref = [data.tokenizer[data.trg_lang].post_process(s) for s in data.trg]
+    valid_ref = [s for s in data.trg]
 
     # if references are given, evaluate 1best generation against them
     if data.has_trg:
@@ -275,6 +309,16 @@ def predict(
                     valid_ref,  # detokenized ref
                     **sacrebleu_cfg,
                 )
+            elif eval_metric == "bleu1":
+                valid_scores[eval_metric] = test_bleu(valid_hyp_1best,valid_ref)[0]
+            elif eval_metric == "bleu2":
+                valid_scores[eval_metric] = test_bleu(valid_hyp_1best,valid_ref)[1]
+            elif eval_metric == "bleu3":
+                valid_scores[eval_metric] = test_bleu(valid_hyp_1best,valid_ref)[2]
+            elif eval_metric == "bleu4":
+                valid_scores[eval_metric] = test_bleu(valid_hyp_1best,valid_ref)[3]
+            elif eval_metric == "rouge":
+                valid_scores[eval_metric] = rouge(valid_hyp_1best,valid_ref)
             elif eval_metric == "chrf":
                 valid_scores[eval_metric] = chrf(
                     valid_hyp_1best,
@@ -295,7 +339,7 @@ def predict(
 
         eval_duration = time.time() - eval_start_time
         score_str = ", ".join([
-            f"{eval_metric}: {valid_scores[eval_metric]:6.2f}"
+            f"{eval_metric}: {valid_scores[eval_metric]}"
             for eval_metric in eval_metrics + ["loss", "ppl", "acc"]
             if not math.isnan(valid_scores[eval_metric])
         ])
@@ -318,6 +362,8 @@ def predict(
         valid_attention_scores,
     )
 
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def test(
     cfg_file,
@@ -341,7 +387,7 @@ def test(
     # pylint: disable=too-many-branches
     cfg = load_config(Path(cfg_file))
     # parse train cfg
-    print("here")
+    print("not here")
     (
         model_dir,
         load_model,
@@ -353,24 +399,42 @@ def test(
     ) = parse_train_args(cfg["training"], mode="prediction")
 
     if len(logger.handlers) == 0:
-        pkg_version = make_logger(model_dir, mode="test")  # version string returned
-        if "joeynmt_version" in cfg:
-            check_version(pkg_version, cfg["joeynmt_version"])
-
+        _ = make_logger(model_dir, mode="test")  # version string returned
+    print("here")
     # load the data
-    if datasets is None:
-        src_vocab, trg_vocab, _, dev_data, test_data = load_data(
-            data_cfg=cfg["data"], datasets=["dev", "test"])
-        data_to_predict = {"dev": dev_data, "test": test_data}
-    else:  # avoid to load data again
-        data_to_predict = {"dev": datasets["dev"], "test": datasets["test"]}
-        src_vocab = datasets["src_vocab"]
-        trg_vocab = datasets["trg_vocab"]
+    with open('sign_data/vocab_src.txt', 'rb') as file:
+        vocab_src=pickle.load(file)
+    with open('sign_data/vocab_trg.txt', 'rb') as file:
+        vocab_trg=pickle.load(file)
+    src_vocab = Vocabulary(vocab_src[:-4])
+    trg_vocab = Vocabulary(vocab_trg[:-4])
+    sequence_encoder = {
+            "text": partial(src_vocab.sentences_to_ids, bos=False, eos=True),
+            "gloss": partial(trg_vocab.sentences_to_ids, bos=True, eos=True),
+        }
+    tokenizer = build_tokenizer(cfg["data"])
+    # train_data = PlaintextDataset(path="dontmatter", src_lang="text", trg_lang="gloss", split="train", sequence_encoder=sequence_encoder)
+    dev_data = PlaintextDataset(path="dontmatter", src_lang="text", trg_lang="gloss", split="valid", sequence_encoder=sequence_encoder, tokenizer=tokenizer)
+    test_data = PlaintextDataset(path="dontmatter", src_lang="text", trg_lang="gloss", split="test", sequence_encoder=sequence_encoder, tokenizer=tokenizer)
+    data_to_predict = {"dev": dev_data, "test": test_data}
+    # if datasets is None:
+        # src_vocab, trg_vocab, _, dev_data, test_data = load_data(
+    #         data_cfg=cfg["data"], datasets=["dev", "test"])
+    #     data_to_predict = {"dev": dev_data, "test": test_data}
+    # else:  # avoid to load data again
+    #     data_to_predict = {"dev": datasets["dev"], "test": datasets["test"]}
+    #     src_vocab = datasets["src_vocab"]
+    #     trg_vocab = datasets["trg_vocab"]
 
     # build model and load parameters into it
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
-
+    # f=open(str(model_dir)+"/num_params.txt","w")
+    # f.write(str(count_parameters(model)))
+    # f.close()
+    
+    print("testting")
     # check options
+    # save_attention=True
     if save_attention:
         if cfg["model"]["decoder"]["type"] == "transformer":
             assert cfg["testing"].get("beam_size", 1) == 1, (
@@ -394,8 +458,7 @@ def test(
             )
 
     # when checkpoint is not specified, take latest (best) from model dir
-    load_model = load_model if ckpt is None else Path(ckpt)
-    ckpt = resolve_ckpt_path(load_model, model_dir)
+    ckpt = resolve_ckpt_path(ckpt, load_model, model_dir)
 
     # load model checkpoint
     model_checkpoint = load_checkpoint(ckpt, device=device)
@@ -422,7 +485,7 @@ def test(
                 "Scoring" if return_prob == "ref" else "Decoding",
                 data_set_name,
             )
-            _, _, hypotheses, hypotheses_raw, seq_scores, att_scores, = predict(
+            scores, _, hypotheses, hypotheses_raw, seq_scores, att_scores, = predict(
                 model=model,
                 data=data_set,
                 compute_loss=return_prob == "ref",
@@ -433,11 +496,14 @@ def test(
                 cfg=cfg["testing"],
                 fp16=fp16,
             )
-            print(seq_scores)
-            # f=open(model_dir+"/"+data_set_name+"_gloss_results.txt","w")
-            # f.write("Loss: " + str(loss) + " DTW: " + str(np.mean(all_dtw_scores)) + " PCK: "+ str(np.mean(pck)))
+            print(model_dir)
+            print(data_set_name)
+            # f=open(str(model_dir)+"\\"+data_set_name+"_results.txt","w")
+            # f.write(" ".join([
+            # f"{eval_metric}: {scores[eval_metric]}"
+            # for eval_metric in ["bleu1", "bleu2", "bleu3", "bleu4", "rouge", "loss", "ppl", "acc"]
+            # if not math.isnan(scores[eval_metric])]))
             # f.close()
-
             if save_attention:
                 if att_scores:
                     attention_file_name = f"{data_set_name}.{ckpt.stem}.att"
@@ -517,13 +583,11 @@ def translate(
     src_cfg = cfg["data"]["src"]
     trg_cfg = cfg["data"]["trg"]
 
-    pkg_version = make_logger(model_dir, mode="translate")  # version string returned
-    if "joeynmt_version" in cfg:
-        check_version(pkg_version, cfg["joeynmt_version"])
+    _ = make_logger(model_dir, mode="translate")
+    # version string returned
 
     # when checkpoint is not specified, take latest (best) from model dir
-    load_model = load_model if ckpt is None else Path(ckpt)
-    ckpt = resolve_ckpt_path(load_model, model_dir)
+    ckpt = resolve_ckpt_path(ckpt, load_model, model_dir)
 
     # read vocabs
     src_vocab, trg_vocab = build_vocab(cfg["data"], model_dir=model_dir)
