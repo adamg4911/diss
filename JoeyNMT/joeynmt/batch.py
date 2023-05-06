@@ -47,7 +47,7 @@ class Batch:
         :param pad_index: *must be the same for both src and trg
         :param is_train: *can be used for online data augmentation, subsampling etc.
         """
-   
+
         self.src: Tensor = src
         self.src_length: Tensor = src_length
         self.src_mask: Tensor = (self.src != pad_index).unsqueeze(1)
@@ -86,8 +86,8 @@ class Batch:
 
         if self.has_trg:
             self.trg_input = self.trg_input.to(device)
-            self.trg = self.trg.to(device)
             self.trg_length = self.trg_length.to(device)
+            self.trg = self.trg.to(device)
             self.trg_mask = self.trg_mask.to(device)
 
     def normalize(
